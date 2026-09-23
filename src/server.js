@@ -1,0 +1,96 @@
+// src/server.js — Production Express API server ONLY
+//
+// This process handles HTTP requests exclusively — no ping engine,
+// no scheduler. Those live in src/pingWorker.js as a completely
+// separate, independent process.
+//
+// This means restarting/updating the API (adding endpoints, fixing
+// bugs in routers.js/analytics.js) never interrupts router monitoring
+// — the ping worker keeps running the whole time.
+
+require('dotenv').config();
+const express    = require('express');
+const cors       = require('cors');
+const morgan     = require('morgan');
+const rateLimit  = require('express-rate-limit');
+const { testConnection } = require('./db');
+const routerRoutes = require('./routes/routers');
+const analyticsRoutes = require('./routes/analytics');
+const routerUpdateRoutes = require('./routes/routerUpdate');
+const saRoutes = require('./routes/sa');
+const deviceRoutes = require('./routes/devices');
+const saStatusRoutes = require('./routes/saStatus');
+
+const app  = express();
+const PORT = parseInt(process.env.PORT) || 3000;
+
+// ── Middleware ────────────────────────────────
+app.use(cors());
+app.use(express.json());
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
+// Rate limiter: max 200 requests / 1 minute per IP
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many requests, slow down.' },
+});
+app.use('/api', limiter);
+
+// ── Routes ────────────────────────────────────
+app.use('/api/routers', routerRoutes);
+app.use('/api', analyticsRoutes);  // /api/ask, /api/analytics/*
+app.use('/api', routerUpdateRoutes); // /api/router-update
+app.use('/api/sa', saRoutes);             // /api/sa/* — sa_monitor site profile CRUD
+app.use('/api/sa-status', saStatusRoutes); // /api/sa-status/* — fixed live snapshot per site
+app.use('/api/devices', deviceRoutes);    // /api/devices/* — sa_monitor PDB/UPS1/UPS2 status & events
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ success: true, uptime: process.uptime(), timestamp: new Date() });
+});
+
+// 404 fallback
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: `Route ${req.method} ${req.path} not found` });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('[SERVER] Unhandled error:', err);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
+
+// ── Graceful shutdown ─────────────────────────
+function shutdown(signal) {
+  console.log(`\n[SERVER] ${signal} received. Shutting down gracefully...`);
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('uncaughtException',  err => console.error('[SERVER] Uncaught:', err));
+process.on('unhandledRejection', err => console.error('[SERVER] Unhandled rejection:', err));
+
+// ── Boot ──────────────────────────────────────
+async function boot() {
+  console.log('═══════════════════════════════════════');
+  console.log('  Router Monitor — API Server            ');
+  console.log('  (Ping engine runs separately — see     ');
+  console.log('   src/pingWorker.js, run as its own process)      ');
+  console.log('═══════════════════════════════════════');
+
+  const dbOk = await testConnection();
+  if (!dbOk) {
+    console.error('[SERVER] Cannot connect to database. Exiting.');
+    process.exit(1);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`[SERVER] API listening on http://localhost:${PORT}`);
+    console.log(`[SERVER] Environment: ${process.env.NODE_ENV}`);
+  });
+}
+
+boot();
